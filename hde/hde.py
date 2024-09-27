@@ -5,13 +5,8 @@ from . import analysis
 
 import tensorflow as tf
 import scipy.linalg
-from keras import backend as K
-from keras.models import Model
-from keras.optimizers import Adam
-import keras.layers as layers
-from keras.regularizers import l2
+from keras import layers, Model, backend as K, regularizers, optimizers
 from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.model_selection import train_test_split
 
 
 __all__ = ['HDE']
@@ -35,18 +30,18 @@ def _inv(x, ret_sqrt=False):
     '''
 
     # Calculate eigvalues and eigvectors
-    eigval_all, eigvec_all = tf.self_adjoint_eig(x)
+    eigval_all, eigvec_all = tf.linalg.eigh(x)
 
     # Filter out eigvalues below threshold and corresponding eigvectors
     eig_th = tf.constant(K.epsilon(), dtype=tf.float32)
-    index_eig = tf.to_int32(eigval_all > eig_th)
+    index_eig = tf.compat.v1.to_int32(eigval_all > eig_th)
     _, eigval = tf.dynamic_partition(eigval_all, index_eig, 2)
     _, eigvec = tf.dynamic_partition(tf.transpose(eigvec_all), index_eig, 2)
 
     # Build the diagonal matrix with the filtered eigenvalues or square
     # root of the filtered eigenvalues according to the parameter
-    eigval_inv = tf.diag(1/eigval)
-    eigval_inv_sqrt = tf.diag(tf.sqrt(1/eigval))
+    eigval_inv = tf.linalg.diag(1/eigval)
+    eigval_inv_sqrt = tf.linalg.diag(tf.sqrt(1/eigval))
     
     cond_sqrt = tf.convert_to_tensor(ret_sqrt)
     
@@ -65,7 +60,7 @@ def create_encoder(input_size, output_size, hidden_layer_depth,
     encoder = layers.Dense(
                         hidden_size, 
                         activation=activation, 
-                        kernel_regularizer=l2(l2_reg)
+                        kernel_regularizer=regularizers.l2(l2_reg)
                     )(encoder_input)
     for _ in range(hidden_layer_depth - 1):
         if batch_norm:
@@ -74,7 +69,7 @@ def create_encoder(input_size, output_size, hidden_layer_depth,
         encoder = layers.Dense(
                             hidden_size, 
                             activation=activation,
-                            kernel_regularizer=l2(l2_reg)
+                            kernel_regularizer=regularizers.l2(l2_reg)
                         )(encoder)
 
         if dropout_rate > 0:
@@ -97,13 +92,13 @@ def create_hde(encoder, input_size):
 
 
 def create_vac_encoder(encoder, input_size, n_components, means, eigenvectors, norms):
-    k_means = K.variable(means)
-    k_eigenvectors = K.variable(eigenvectors)
-    k_norms = K.variable(norms)
+    k_means = tf.Variable(initial_value=means)
+    k_eigenvectors = tf.Variable(initial_value=eigenvectors)
+    k_norms = tf.Variable(initial_value=norms)
 
     def layer(x, n_components=n_components, means=k_means, eigenvectors=k_eigenvectors, norms=k_norms):
         x -= means
-        z = K.dot(x, eigenvectors)
+        z = tf.linalg.matmul(x, eigenvectors) # TODO: does this work in all dimensions?
         z /= norms
         return z
     
@@ -116,12 +111,12 @@ def create_vac_encoder(encoder, input_size, n_components, means, eigenvectors, n
 
 
 def create_vamp_encoder(encoder, input_size, n_components, means, singular_values):
-    k_means = K.variable(means)
-    k_singular_vals = K.variable(singular_values)
+    k_means = tf.Variable(initial_value=means)
+    k_singular_vals = tf.Variable(initial_value=singular_values)
 
     def layer(x, n_components=n_components, means=k_means, singular_values=k_singular_vals):
         x -= means 
-        z = K.dot(x, singular_values)
+        z = tf.linalg.matmul(x, singular_values)
         return z
     
     inp = layers.Input(shape=(input_size,))
@@ -276,46 +271,46 @@ class HDE(BaseEstimator, TransformerMixin):
     @learning_rate.setter
     def learning_rate(self, value):
         self._learning_rate_ = value
-        self.optimizer = Adam(lr=value)
+        self.optimizer = optimizers.Adam(lr=value)
         self._recompile = True
 
 
     def _corr(self, x, y):
-        xc = x - K.mean(x)
-        yc = y - K.mean(y)
-        corr = K.mean(xc*yc)/(K.std(x)*K.std(y))
+        xc = x - tf.reduce_mean(x)
+        yc = y - tf.reduce_mean(y)
+        corr = tf.reduce_mean(xc * yc) / (tf.math.reduce_std(x) * tf.math.reduce_std(y))
         return corr
 
 
     def _loss(self, z_dummy, z):
-        N = tf.to_float(tf.shape(z)[0])
+        N = tf.cast(tf.shape(z)[0], tf.float32)
 
         z_t0 = z[:, :self.n_components]
-        z_t0 -= K.mean(z_t0, axis=0)
+        z_t0 -= tf.reduce_mean(z_t0, axis=0)
         
         z_tt = z[:, self.n_components:]
-        z_tt -= K.mean(z_tt, axis=0)
+        z_tt -= tf.reduce_mean(z_tt, axis=0)
 
-        C00 = 1/(N - 1)*K.dot(K.transpose(z_t0), z_t0)
-        C01 = 1/(N - 1)*K.dot(K.transpose(z_t0), z_tt)
-        C10 = 1/(N - 1)*K.dot(K.transpose(z_tt), z_t0)
-        C11 = 1/(N - 1)*K.dot(K.transpose(z_tt), z_tt)
+        C00 = 1/(N - 1)*tf.linalg.matmul(tf.transpose(z_t0), z_t0)
+        C01 = 1/(N - 1) * tf.linalg.matmul(tf.transpose(z_t0), z_tt)
+        C10 = 1/(N - 1) * tf.linalg.matmul(tf.transpose(z_tt), z_t0)
+        C11 = 1/(N - 1) * tf.linalg.matmul(tf.transpose(z_tt), z_tt)
 
         if not self.reversible:
-            vamp_matrix = K.dot(K.dot(_inv(C00, ret_sqrt=True), C01), _inv(C11, ret_sqrt=True))
+            vamp_matrix = tf.linalg.matmul(tf.linalg.matmul(_inv(C00, ret_sqrt=True), C01), _inv(C11, ret_sqrt=True))
             vamp_score = tf.norm(vamp_matrix)
             return -1.0 - tf.square(vamp_score)
         else:
             C0 = 0.5*(C00 + C11)
             C1 = 0.5*(C01 + C10)
             
-            L = tf.cholesky(C0)
-            Linv = tf.matrix_inverse(L)
+            L = tf.linalg.cholesky(C0)
+            Linv = tf.linalg.inv(L)
 
-            A = K.dot(K.dot(Linv, C1), K.transpose(Linv))
+            A = tf.linalg.matmul(tf.linalg.matmul(Linv, C1), tf.transpose(Linv))
 
-            lambdas, _ = tf.self_adjoint_eig(A)
-            return -1.0 - K.sum(self.weights*lambdas**2)
+            lambdas, _ = tf.linalg.eig(A)
+            return -1.0 - tf.reduce_sum(self.weights*lambdas**2)
 
 
     def _create_dataset(self, data, lag_time=None):
@@ -424,7 +419,7 @@ class HDE(BaseEstimator, TransformerMixin):
             callbacks=self.callbacks,
             batch_size=self.batch_size, 
             epochs=self.n_epochs, 
-            verbose=self.verbose
+            verbose="2" if self.verbose else "0"
         )
     
         if type(X) is list:
@@ -487,6 +482,6 @@ class HDE(BaseEstimator, TransformerMixin):
         raise RuntimeError('Model needs to be fit first.')
 
 
-    def fit_transform(self, X, y=None, side='left'):
+    def fit_transform(self, X, y=None, **_):
         self.fit(X, y)
-        return self.transform(X, side)
+        return self.transform(X, side='left')
